@@ -49,8 +49,13 @@ param modelDeployments array = [
 @description('Principal ID to grant AI User role (your pipeline identity)')
 param deployerPrincipalId string = ''
 
-// Short name for Key Vault (max 24 chars: 3-24 alphanumeric + hyphens)
-var kvShortBase = replace(baseName, 'foundry-demo-', 'fd-')
+// Key Vault names are GLOBALLY unique across ALL of Azure and limited to 3-24
+// chars. A hardcoded name (e.g. kv-fd-<base>-<env>) collides the moment anyone
+// else — in any tenant — has used it, and the name stays reserved while the
+// vault is soft-deleted. Deriving the name from uniqueString(resourceGroup().id)
+// guarantees a collision-free name that is also STABLE across redeployments of
+// the same resource group (so the deployment stays idempotent).
+var kvName = take('kv-${environment}-${uniqueString(resourceGroup().id)}', 24)
 
 // ---------------------------------------------------------------------------
 // Key Vault
@@ -61,7 +66,7 @@ var kvShortBase = replace(baseName, 'foundry-demo-', 'fd-')
 module keyVault 'modules/keyvault.bicep' = {
   name: 'key-vault'
   params: {
-    name: 'kv-${kvShortBase}-${environment}'
+    name: kvName
     location: location
     deployerPrincipalId: deployerPrincipalId
   }

@@ -57,10 +57,19 @@ def find_agent(client: AIProjectClient, agent_name: str):
 
 def send_query(openai_client, agent_name: str, query: str, conversation_id: str = None) -> dict:
     """
-    Send a query to the agent via the Foundry Responses API.
+    Send a query to the agent via the Foundry Responses API and drive the
+    function-tool loop until the agent produces a final text answer.
 
-    SDK v2 pattern: conversations.create() + responses.create() with agent_reference.
+    Custom function tools (e.g. calculator) are NOT executed server-side — the
+    Responses API hands the call back to us and waits for function_call_output
+    before producing a final answer. We execute the tool locally via the shared
+    dispatch helper and submit the result so the agent can finish its turn.
+
+    SDK v2 pattern: conversations.create() + responses.create() with
+    agent_reference, looping on function_call items.
     """
+    from src.agent.tools import execute_function_tool
+
     start_time = time.time()
 
     # Create a conversation if none provided
@@ -68,34 +77,48 @@ def send_query(openai_client, agent_name: str, query: str, conversation_id: str 
         conversation = openai_client.conversations.create()
         conversation_id = conversation.id
 
-    # Send the query via the Responses API with agent_reference
+    agent_ref = {"agent_reference": {"name": agent_name, "type": "agent_reference"}}
+
     response = openai_client.responses.create(
         conversation=conversation_id,
-        extra_body={
-            "agent_reference": {
-                "name": agent_name,
-                "type": "agent_reference",
-            }
-        },
+        extra_body=agent_ref,
         input=query,
     )
 
+    # Drive the function-tool loop: execute any function calls locally and
+    # submit their outputs until the agent stops requesting tools.
+    tool_calls = []
+    for _ in range(5):
+        function_calls = [
+            item for item in (getattr(response, "output", None) or [])
+            if getattr(item, "type", None) == "function_call"
+        ]
+        if not function_calls:
+            break
+
+        tool_outputs = []
+        for fc in function_calls:
+            name = getattr(fc, "name", "unknown")
+            arguments = getattr(fc, "arguments", "{}")
+            call_id = getattr(fc, "call_id", None) or getattr(fc, "id", "")
+            output = execute_function_tool(name, arguments)
+            tool_calls.append({"name": name, "arguments": arguments, "output": output})
+            tool_outputs.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            })
+
+        response = openai_client.responses.create(
+            conversation=conversation_id,
+            extra_body=agent_ref,
+            input=tool_outputs,
+        )
+
     elapsed = time.time() - start_time
 
-    # Extract response text
+    # Extract final response text
     response_text = response.output_text if hasattr(response, "output_text") else str(response)
-
-    # Extract tool calls from response output items
-    tool_calls = []
-    if hasattr(response, "output"):
-        for item in response.output:
-            item_type = getattr(item, "type", "")
-            if item_type == "function_call":
-                tool_calls.append({
-                    "name": getattr(item, "name", "unknown"),
-                    "arguments": getattr(item, "arguments", ""),
-                    "output": getattr(item, "output", None),
-                })
 
     return {
         "response": response_text,

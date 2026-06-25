@@ -47,92 +47,15 @@ sys.path.insert(0, str(project_root))
 # -----------------------------------------------------------------------------
 # Function tool dispatch
 # -----------------------------------------------------------------------------
-# When the agent invokes a custom function tool (e.g. calculator), the
-# Responses API returns the call to US — the server does not execute our code.
-# We execute the function locally and submit results back to continue the run.
+# When the agent invokes a custom function tool (e.g. calculator), the Responses
+# API returns the call to US — the server does not execute our code. We execute
+# the function locally and submit results back to continue the run. That logic
+# is shared with test_agent.py via src/agent/tools/dispatch.py (run_agent_turn).
 #
-# To register a new tool here:
-#   1. Add execute_<name> to src/agent/tools/<name>.py
-#   2. Export it via src/agent/tools/__init__.py
-#   3. Add an entry to _build_function_tool_registry() below
+# To register a new tool: add execute_<name> to src/agent/tools/<name>.py,
+# export it from src/agent/tools/__init__.py, and register it in
+# build_function_tool_registry() in dispatch.py.
 # -----------------------------------------------------------------------------
-def _build_function_tool_registry() -> dict:
-    """Build name -> executor map for all custom function tools."""
-    from src.agent.tools.calculator import execute_calculator
-    return {"calculator": execute_calculator}
-
-
-def _execute_function_tool(name: str, arguments: str) -> str:
-    """Execute a function tool and return JSON-serialized output."""
-    registry = _build_function_tool_registry()
-    if name not in registry:
-        return json.dumps({"error": f"Unknown function tool: {name}"})
-    try:
-        args = json.loads(arguments) if arguments else {}
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid arguments JSON: {e}"})
-    try:
-        result = registry[name](**args)
-    except Exception as e:  # noqa: BLE001 — surface the actual failure to the agent
-        return json.dumps({"error": f"Tool execution failed: {e}"})
-    return json.dumps(result)
-
-
-def _query_agent_with_tool_loop(
-    openai_client,
-    agent_name: str,
-    question: str,
-    max_iterations: int = 5,
-) -> tuple[str, list[dict]]:
-    """
-    Send a question to a Foundry agent via the Responses API and execute any
-    function tool calls in a loop until the agent produces a final text answer.
-
-    Returns:
-        (answer_text, tool_calls) where tool_calls is a list of
-        {"name": str, "arguments": str, "output": str} for diagnostics.
-    """
-    conversation = openai_client.conversations.create()
-    agent_ref = {"agent_reference": {"name": agent_name, "type": "agent_reference"}}
-
-    response = openai_client.responses.create(
-        conversation=conversation.id,
-        extra_body=agent_ref,
-        input=question,
-    )
-
-    executed_calls: list[dict] = []
-
-    for _ in range(max_iterations):
-        function_calls = [
-            item for item in (getattr(response, "output", None) or [])
-            if getattr(item, "type", None) == "function_call"
-        ]
-        if not function_calls:
-            break
-
-        tool_outputs = []
-        for fc in function_calls:
-            name = getattr(fc, "name", "")
-            arguments = getattr(fc, "arguments", "{}")
-            call_id = getattr(fc, "call_id", None) or getattr(fc, "id", "")
-            output = _execute_function_tool(name, arguments)
-            executed_calls.append({"name": name, "arguments": arguments, "output": output})
-            tool_outputs.append({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": output,
-            })
-
-        response = openai_client.responses.create(
-            conversation=conversation.id,
-            extra_body=agent_ref,
-            input=tool_outputs,
-            previous_response_id=response.id,
-        )
-
-    answer = getattr(response, "output_text", "") or ""
-    return answer, executed_calls
 
 
 def _score_agent_metrics(
@@ -251,10 +174,11 @@ def _run_real_evaluation(endpoint: str, eval_data: list[dict], eval_model: str =
         # function tool, the Responses API hands the call back to us and waits
         # for `function_call_output` items before producing a text answer.
         openai_client = client.get_openai_client()
+        from src.agent.tools import run_agent_turn
         responses = []
         for i, case in enumerate(eval_data):
             question = case.get("question", case.get("input", ""))
-            answer, tool_calls = _query_agent_with_tool_loop(openai_client, agent.name, question)
+            answer, tool_calls, _status = run_agent_turn(openai_client, agent.name, question)
 
             if not answer:
                 print(f"  ⚠️  [{i+1}/{len(eval_data)}] empty answer; tool_calls={tool_calls}")
@@ -315,7 +239,10 @@ def _run_real_evaluation(endpoint: str, eval_data: list[dict], eval_model: str =
                 continue
             g = groundedness_eval(response=resp["answer"], context=resp["expected"])
             r = relevance_eval(response=resp["answer"], query=resp["question"])
-            c = coherence_eval(response=resp["answer"])
+            # CoherenceEvaluator (azure-ai-evaluation >=1.15) requires `query`
+            # in addition to `response` — it scores coherence of the answer
+            # relative to the question that prompted it.
+            c = coherence_eval(query=resp["question"], response=resp["answer"])
             scores["groundedness"].append(g.get("groundedness", 0))
             scores["relevance"].append(r.get("relevance", 0))
             scores["coherence"].append(c.get("coherence", 0))
