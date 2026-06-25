@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -132,6 +133,45 @@ def _base_ai_services_endpoint(project_endpoint: str) -> str:
     if marker in path:
         path = path.split(marker, 1)[0]
     return urlunparse((parsed.scheme, parsed.netloc, path.rstrip("/"), "", "", ""))
+
+
+# Substrings that identify a transient (retryable) evaluator failure. The
+# judge-model calls occasionally hit connection resets or rate limits — the SDK
+# retries 429s internally but surfaces dropped connections as a WrappedOpenAIError
+# that would otherwise crash the whole gate.
+_TRANSIENT_EVAL_MARKERS = (
+    "connection error", "apiconnectionerror", "readerror", "read timeout",
+    "timed out", "timeout", "too many requests", "429",
+    "temporarily unavailable", "service unavailable", "internalservererror",
+    "bad gateway", "502", "503", "504",
+)
+
+
+def _eval_with_retry(evaluator, *, max_attempts: int = 5, delay_seconds: int = 20, **kwargs):
+    """Call an azure-ai-evaluation evaluator, retrying transient failures.
+
+    A transient network blip while scoring (e.g. an ``httpx.ReadError`` surfaced
+    as ``APIConnectionError``) should not fail the quality gate. Retry only on
+    clearly transient errors and re-raise anything else immediately so genuine
+    problems still surface loudly.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return evaluator(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — classify by message, then re-raise
+            message = str(exc).lower()
+            is_transient = any(marker in message for marker in _TRANSIENT_EVAL_MARKERS)
+            if not is_transient or attempt == max_attempts:
+                raise
+            last_error = exc
+            print(
+                f"  ⏳ Evaluator call failed transiently "
+                f"(attempt {attempt}/{max_attempts}): {type(exc).__name__}. "
+                f"Retrying in {delay_seconds}s..."
+            )
+            time.sleep(delay_seconds)
+    raise last_error  # type: ignore[misc]
 
 
 def _run_real_evaluation(endpoint: str, eval_data: list[dict], eval_model: str = "gpt-4o-mini") -> dict[str, float]:
@@ -237,12 +277,12 @@ def _run_real_evaluation(endpoint: str, eval_data: list[dict], eval_model: str =
                 scores["relevance"].append(0.0)
                 scores["coherence"].append(0.0)
                 continue
-            g = groundedness_eval(response=resp["answer"], context=resp["expected"])
-            r = relevance_eval(response=resp["answer"], query=resp["question"])
+            g = _eval_with_retry(groundedness_eval, response=resp["answer"], context=resp["expected"])
+            r = _eval_with_retry(relevance_eval, response=resp["answer"], query=resp["question"])
             # CoherenceEvaluator (azure-ai-evaluation >=1.15) requires `query`
             # in addition to `response` — it scores coherence of the answer
             # relative to the question that prompted it.
-            c = coherence_eval(query=resp["question"], response=resp["answer"])
+            c = _eval_with_retry(coherence_eval, query=resp["question"], response=resp["answer"])
             scores["groundedness"].append(g.get("groundedness", 0))
             scores["relevance"].append(r.get("relevance", 0))
             scores["coherence"].append(c.get("coherence", 0))
