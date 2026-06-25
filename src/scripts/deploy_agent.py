@@ -34,13 +34,56 @@
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
+from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from dotenv import load_dotenv  # noqa: E402 — must be before our imports
 
 # Add project root to path so we can import our modules
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+
+def _create_version_with_retry(
+    agents_client,
+    config,
+    sdk_params,
+    max_attempts: int = 12,
+    delay_seconds: int = 30,
+):
+    """Create a new agent version, tolerating RBAC propagation delays.
+
+    The pipeline identity's data-plane role (``Cognitive Services User``) is
+    granted by the infrastructure deployment immediately before this script
+    runs. A freshly-created role assignment can take a few minutes to propagate
+    to the Cognitive Services data plane, so the very first deploy after
+    provisioning may transiently return 401/403. Retry on auth/permission and
+    transient errors; fail fast on everything else (e.g. a bad config).
+    """
+    retryable_status = {401, 403, 429, 500, 502, 503, 504}
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return agents_client.create_version(
+                agent_name=config.name,
+                definition=sdk_params["definition"],
+                metadata=sdk_params.get("metadata"),
+            )
+        except (ClientAuthenticationError, HttpResponseError) as exc:
+            status = getattr(exc, "status_code", None)
+            is_retryable = isinstance(exc, ClientAuthenticationError) or status in retryable_status
+            if not is_retryable or attempt == max_attempts:
+                raise
+            last_error = exc
+            print(
+                f"  ⏳ Attempt {attempt}/{max_attempts} failed "
+                f"({status or type(exc).__name__}). Likely RBAC propagation — "
+                f"retrying in {delay_seconds}s..."
+            )
+            time.sleep(delay_seconds)
+    # Unreachable, but keeps type checkers happy.
+    raise last_error  # type: ignore[misc]
 
 
 def deploy_agent(environment: str, dry_run: bool = False) -> None:
@@ -138,11 +181,7 @@ def deploy_agent(environment: str, dry_run: bool = False) -> None:
         # If the agent name doesn't exist yet, it creates the agent.
         # If it already exists, it creates a new version with the updated config.
         print(f"  🚀 Deploying agent '{config.name}'...")
-        agent = agents_client.create_version(
-            agent_name=config.name,
-            definition=sdk_params["definition"],
-            metadata=sdk_params.get("metadata"),
-        )
+        agent = _create_version_with_retry(agents_client, config, sdk_params)
         print("  ✅ Agent deployed successfully!")
         print(f"  📋 Agent ID: {agent.id}")
         print(f"  🏷️  Name:     {agent.name}")
