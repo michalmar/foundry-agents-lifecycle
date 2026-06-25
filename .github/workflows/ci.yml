@@ -23,6 +23,7 @@ on:
     branches: [main]
   push:
     branches: [main]  # Also run on direct pushes to main
+  workflow_dispatch:  # Allow manual validation runs from the Actions tab
 
 # ---------------------------------------------------------------------------
 # PERMISSIONS
